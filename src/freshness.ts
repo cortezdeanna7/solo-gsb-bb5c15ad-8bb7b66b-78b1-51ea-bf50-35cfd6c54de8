@@ -5,6 +5,7 @@ import {
   CacheControlDirectives,
   EntryRow,
   HeaderMap,
+  StaleFallbackRecord,
   TrailStep,
 } from './types';
 
@@ -47,7 +48,163 @@ export interface FreshnessResult {
 }
 
 const CACHEABLE_METHODS = new Set(['GET', 'HEAD']);
-const STALE_OVERRIDE_STATUS = new Set([500, 502, 503, 504]);
+/**
+ * RFC 5861 stale-if-error 允许以旧副本顶替的源站状态码：
+ * 500 / 502 / 503 / 504（不含 4xx 与未定义的 505+）。
+ */
+export const STALE_OVERRIDE_STATUS = new Set([500, 502, 503, 504]);
+
+/**
+ * 回源得到 5xx（500/502/503/504）后的 stale-if-error 判定（纯函数）。
+ *
+ * - 旧条目声明了 stale-if-error=Δ，且 Age（取回源 originTime）不超过 lifetime+Δ
+ *   => 保留旧 body 与 headers（reason=served-stale-if-error）；
+ * - 超窗、未声明 stale-if-error、或没有旧条目 => 不回退，由调用方保留错误结果。
+ *
+ * 返回的记录携带原因、年龄、窗口与逐步 trail，随令牌持久化，
+ * 让并发等待者下一次请求能观察到同一次结论。
+ */
+export function evaluateStaleIfError(params: {
+  oldEntry: EntryRow | undefined;
+  originStatus: number;
+  originTime: number;
+}): StaleFallbackRecord | null {
+  if (!STALE_OVERRIDE_STATUS.has(params.originStatus)) return null;
+
+  const trail: TrailStep[] = [];
+  const { oldEntry, originStatus, originTime } = params;
+
+  trail.push({
+    step: 'stale-if-error',
+    detail: `回源得到 ${originStatus}：检查旧副本是否可按 stale-if-error 顶替`,
+    data: { originStatus, originTime, overrideStatuses: [...STALE_OVERRIDE_STATUS] },
+  });
+
+  if (!oldEntry) {
+    trail.push({
+      step: 'stale-if-error',
+      detail: '缓存中没有可顶替的旧条目：stale-if-error 无可用副本，保留错误结果',
+    });
+    return {
+      servedStale: false,
+      reason: 'stale-if-error-entry-missing',
+      detail: '回源返回 5xx 但无旧副本可供 stale-if-error 服务，保留错误结果',
+      originStatus,
+      ageMs: 0,
+      ageSeconds: 0,
+      lifetimeMs: 0,
+      staleIfErrorMs: 0,
+      staleIfErrorSeconds: 0,
+      windowEndMs: null,
+      staleStoredAt: null,
+      trail,
+    };
+  }
+
+  const oldHeaders = JSON.parse(oldEntry.response_headers) as HeaderMap;
+  const { directives: oldCC } = parseCacheControl(oldHeaders['cache-control']);
+  const ageMs = Math.max(0, originTime - oldEntry.stored_at);
+  const lifetimeMs = computeLifetimeMs(oldHeaders, oldCC, oldEntry.stored_at).lifetimeMs;
+  const sieSeconds = oldCC['stale-if-error'] ?? 0;
+  const sieMs = sieSeconds * 1000;
+  const windowEndMs = lifetimeMs + sieMs;
+
+  trail.push({
+    step: 'age',
+    detail: `旧副本 Age = originTime(${originTime}) - storedAt(${oldEntry.stored_at}) = ${ageMs} ms`,
+    data: {
+      virtualTime: originTime,
+      storedAt: oldEntry.stored_at,
+      ageMs,
+      ageSeconds: Math.floor(ageMs / 1000),
+    },
+  });
+  trail.push({
+    step: 'lifetime',
+    detail: `旧副本新鲜寿命 lifetime=${lifetimeMs}ms`,
+    data: { lifetimeMs },
+  });
+
+  if (sieMs <= 0) {
+    trail.push({
+      step: 'stale-if-error',
+      detail: '旧副本未声明 stale-if-error：不允许以旧响应顶替 5xx，保留错误结果',
+    });
+    return {
+      servedStale: false,
+      reason: 'stale-if-error-not-declared',
+      detail: '回源返回 5xx 但旧副本未声明 stale-if-error，保留错误结果',
+      originStatus,
+      ageMs,
+      ageSeconds: Math.floor(ageMs / 1000),
+      lifetimeMs,
+      staleIfErrorMs: 0,
+      staleIfErrorSeconds: 0,
+      windowEndMs,
+      staleStoredAt: oldEntry.stored_at,
+      trail,
+    };
+  }
+
+  trail.push({
+    step: 'stale-if-error',
+    detail:
+      `旧副本声明 stale-if-error=${sieSeconds}s：可顶替窗口上界 lifetime(${lifetimeMs}ms) + SIE(${sieMs}ms) = ${windowEndMs}ms`,
+    data: {
+      staleIfErrorSeconds: sieSeconds,
+      staleIfErrorMs: sieMs,
+      windowStart: lifetimeMs,
+      windowEndMs,
+      ageMs,
+    },
+  });
+
+  if (ageMs <= windowEndMs) {
+    trail.push({
+      step: 'stale-if-error',
+      detail:
+        `Age=${ageMs}ms ≤ ${windowEndMs}ms：仍在 stale-if-error 窗口内，保留旧 body 与 headers，` +
+        '令牌照常结束，等待者重放即可看到同一旧响应',
+      data: { withinWindow: true, remainingMs: windowEndMs - ageMs },
+    });
+    return {
+      servedStale: true,
+      reason: 'served-stale-if-error',
+      detail: `回源返回 ${originStatus}，旧副本仍在 stale-if-error=${sieSeconds}s 窗口内，已保留旧响应`,
+      originStatus,
+      ageMs,
+      ageSeconds: Math.floor(ageMs / 1000),
+      lifetimeMs,
+      staleIfErrorMs: sieMs,
+      staleIfErrorSeconds: sieSeconds,
+      windowEndMs,
+      staleStoredAt: oldEntry.stored_at,
+      trail,
+    };
+  }
+
+  trail.push({
+    step: 'stale-if-error',
+    detail:
+      `Age=${ageMs}ms 已超出 stale-if-error 窗口上界 ${windowEndMs}ms（超出 ${ageMs - windowEndMs}ms）：` +
+      '不得再以旧副本顶替，保留错误结果',
+    data: { withinWindow: false, overdueMs: ageMs - windowEndMs },
+  });
+  return {
+    servedStale: false,
+    reason: 'stale-if-error-window-exceeded',
+    detail: `回源返回 ${originStatus}，但旧副本 Age 已超出 stale-if-error=${sieSeconds}s 窗口，保留错误结果`,
+    originStatus,
+    ageMs,
+    ageSeconds: Math.floor(ageMs / 1000),
+    lifetimeMs,
+    staleIfErrorMs: sieMs,
+    staleIfErrorSeconds: sieSeconds,
+    windowEndMs,
+    staleStoredAt: oldEntry.stored_at,
+    trail,
+  };
+}
 
 /**
  * 纯函数：给定缓存条目（可能不存在）与带虚拟时间的请求，产出状态与解释轨迹。
@@ -382,6 +539,8 @@ export function evaluateFreshness(input: FreshnessInputs): FreshnessResult {
 /**
  * 新鲜寿命（毫秒），优先级：
  *   s-maxage > max-age > Expires > 启发式（10% × (storedAt - Last-Modified)）> 0
+ *
+ * 同时把每一步来源写入 trail。
  */
 function computeLifetime(
   headers: HeaderMap,
@@ -389,57 +548,95 @@ function computeLifetime(
   storedAt: number,
   trail: TrailStep[]
 ): { lifetimeMs: number } {
+  const r = computeLifetimeMs(headers, cc, storedAt);
+  switch (r.source) {
+    case 's-maxage':
+      trail.push({
+        step: 'lifetime',
+        detail: `共享缓存采用 s-maxage=${cc['s-maxage']}s（优先于 max-age 与 Expires）=> ${r.lifetimeMs}ms`,
+        data: { source: 's-maxage', lifetimeMs: r.lifetimeMs },
+      });
+      break;
+    case 'max-age':
+      trail.push({
+        step: 'lifetime',
+        detail: `采用 Cache-Control: max-age=${cc['max-age']}s => lifetime=${r.lifetimeMs}ms`,
+        data: { source: 'max-age', lifetimeMs: r.lifetimeMs },
+      });
+      break;
+    case 'immutable-note':
+      trail.push({
+        step: 'lifetime',
+        detail: '响应带 immutable 但未给 max-age：immutable 不改变寿命，仅表示新鲜期内无需重新验证',
+      });
+      break;
+    case 'expires':
+      trail.push({
+        step: 'lifetime',
+        detail: `无 max-age，采用 Expires(${headers['expires']})：expires-storedAt=${r.expiresAt}-${storedAt}=${r.lifetimeMs}ms`,
+        data: { source: 'expires', expiresAt: r.expiresAt, lifetimeMs: r.lifetimeMs },
+      });
+      break;
+    case 'heuristic-last-modified':
+      trail.push({
+        step: 'lifetime',
+        detail:
+          `既无 max-age 也无 Expires，采用启发式：10% × (storedAt(${storedAt}) - Last-Modified(${r.lastModifiedAt})) = ${r.lifetimeMs}ms`,
+        data: {
+          source: 'heuristic-last-modified',
+          lastModifiedAt: r.lastModifiedAt,
+          lifetimeMs: r.lifetimeMs,
+        },
+      });
+      break;
+    case 'none':
+      trail.push({
+        step: 'lifetime',
+        detail: '没有任何显式新鲜期信息（max-age/s-maxage/Expires/Last-Modified）：寿命按 0 处理，存入即陈旧',
+        data: { source: 'none', lifetimeMs: 0 },
+      });
+      break;
+  }
+  return { lifetimeMs: r.lifetimeMs };
+}
+
+/** 纯寿命计算（不写 trail）：请求判定与 stale-if-error 回退判定共用 */
+export function computeLifetimeMs(
+  headers: HeaderMap,
+  cc: CacheControlDirectives,
+  storedAt: number
+): {
+  lifetimeMs: number;
+  source: string;
+  expiresAt?: number;
+  lastModifiedAt?: number;
+} {
   if (cc['s-maxage'] !== undefined) {
-    const ms = cc['s-maxage'] * 1000;
-    trail.push({
-      step: 'lifetime',
-      detail: `共享缓存采用 s-maxage=${cc['s-maxage']}s（优先于 max-age 与 Expires）=> ${ms}ms`,
-      data: { source: 's-maxage', lifetimeMs: ms },
-    });
-    return { lifetimeMs: ms };
+    return { lifetimeMs: cc['s-maxage'] * 1000, source: 's-maxage' };
   }
   if (cc['max-age'] !== undefined) {
-    const ms = cc['max-age'] * 1000;
-    trail.push({
-      step: 'lifetime',
-      detail: `采用 Cache-Control: max-age=${cc['max-age']}s => lifetime=${ms}ms`,
-      data: { source: 'max-age', lifetimeMs: ms },
-    });
-    return { lifetimeMs: ms };
+    return { lifetimeMs: cc['max-age'] * 1000, source: 'max-age' };
   }
   if (cc.immutable) {
-    trail.push({
-      step: 'lifetime',
-      detail: '响应带 immutable 但未给 max-age：immutable 不改变寿命，仅表示新鲜期内无需重新验证',
-    });
+    // immutable 本身不给寿命，继续走后续来源；仅在最终无其他来源时留一条说明
   }
   const expires = parseHttpDate(headers['expires']);
   if (expires !== null) {
-    const ms = Math.max(0, expires - storedAt);
-    trail.push({
-      step: 'lifetime',
-      detail: `无 max-age，采用 Expires(${headers['expires']})：expires-storedAt=${expires}-${storedAt}=${ms}ms`,
-      data: { source: 'expires', expiresAt: expires, lifetimeMs: ms },
-    });
-    return { lifetimeMs: ms };
+    return {
+      lifetimeMs: Math.max(0, expires - storedAt),
+      source: 'expires',
+      expiresAt: expires,
+    };
   }
   const lastModified = parseHttpDate(headers['last-modified']);
   if (lastModified !== null && lastModified < storedAt) {
-    const ms = Math.floor((storedAt - lastModified) * 0.1);
-    trail.push({
-      step: 'lifetime',
-      detail:
-        `既无 max-age 也无 Expires，采用启发式：10% × (storedAt(${storedAt}) - Last-Modified(${lastModified})) = ${ms}ms`,
-      data: { source: 'heuristic-last-modified', lastModifiedAt: lastModified, lifetimeMs: ms },
-    });
-    return { lifetimeMs: ms };
+    return {
+      lifetimeMs: Math.floor((storedAt - lastModified) * 0.1),
+      source: 'heuristic-last-modified',
+      lastModifiedAt: lastModified,
+    };
   }
-  trail.push({
-    step: 'lifetime',
-    detail: '没有任何显式新鲜期信息（max-age/s-maxage/Expires/Last-Modified）：寿命按 0 处理，存入即陈旧',
-    data: { source: 'none', lifetimeMs: 0 },
-  });
-  return { lifetimeMs: 0 };
+  return { lifetimeMs: 0, source: cc.immutable ? 'immutable-note' : 'none' };
 }
 
 function result(

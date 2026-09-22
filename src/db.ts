@@ -3,7 +3,8 @@ import { randomUUID } from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import type { AnalyticsDecisionRow } from './analytics';
-import { EntryRow, HeaderMap, TokenRow } from './types';
+import { evaluateStaleIfError } from './freshness';
+import { EntryRow, HeaderMap, StaleFallbackRecord, TokenRow } from './types';
 import { generateToken, sha256, stableStringify } from './util';
 
 export interface NewEntry {
@@ -27,10 +28,14 @@ export interface RevalidationInput {
 }
 
 export interface ApplyRevalidationResult {
-  outcome: 'updated' | 'not_modified_merged' | 'already_consumed';
+  outcome: 'updated' | 'not_modified_merged' | 'served-stale-if-error' | 'already_consumed';
   idempotentReplay: boolean;
   conflict?: string;
   entry?: EntryRow;
+  /** stale-if-error 回退判定记录（仅回源得到 5xx 时存在） */
+  fallback?: StaleFallbackRecord | null;
+  /** 提交的回源状态码（304 合并时为旧状态码） */
+  originStatus?: number;
 }
 
 /** 失效计划中「Vary 变体已精确命中」的目标键 */
@@ -149,7 +154,9 @@ export class CacheStore {
         result_summary TEXT,
         method         TEXT,
         normalized_url TEXT,
-        vary_names     TEXT
+        vary_names     TEXT,
+        origin_status  INTEGER,
+        fallback_json  TEXT
       );
       CREATE INDEX IF NOT EXISTS idx_tokens_key_status ON tokens(cache_key, status);
 
@@ -196,6 +203,8 @@ export class CacheStore {
     this.addColumnIfMissing('tokens', 'method', 'TEXT');
     this.addColumnIfMissing('tokens', 'normalized_url', 'TEXT');
     this.addColumnIfMissing('tokens', 'vary_names', 'TEXT');
+    this.addColumnIfMissing('tokens', 'origin_status', 'INTEGER');
+    this.addColumnIfMissing('tokens', 'fallback_json', 'TEXT');
   }
 
   /** 老库的轻量列迁移（SQLite 不支持 IF NOT EXISTS 的 ADD COLUMN） */
@@ -333,6 +342,20 @@ export class CacheStore {
       .get(cacheKey) as TokenRow | undefined;
   }
 
+  /**
+   * 该键最近一个已结束（consumed/released）的令牌，按签发时间倒序。
+   * 供并发等待者「下一次请求」观察上一轮回源结论（如 stale-if-error 回退）。
+   */
+  getLatestClosedToken(cacheKey: string): TokenRow | undefined {
+    return this.db
+      .prepare(
+        `SELECT * FROM tokens
+          WHERE cache_key = ? AND status != 'pending'
+          ORDER BY issued_at DESC, rowid DESC LIMIT 1`
+      )
+      .get(cacheKey) as TokenRow | undefined;
+  }
+
   listTokens(includeClosed: boolean, limit: number): TokenRow[] {
     const sql = includeClosed
       ? 'SELECT * FROM tokens ORDER BY issued_at DESC LIMIT ?'
@@ -359,8 +382,10 @@ export class CacheStore {
    * - 相同 payloadHash 重复提交 => 幂等成功（idempotentReplay=true）
    * - 不同 payloadHash => 409，不修改任何数据
    * - status=304 时与缓存中的旧响应合并
+   * - status∈{500,502,503,504} 时先做 stale-if-error 判定：
+   *   窗口内保留旧条目（served-stale-if-error），否则照常写入错误结果
    *
-   * 整个过程在一个事务中完成：令牌置 consumed 与条目更新原子发生。
+   * 整个过程在一个事务中完成：令牌置 consumed、条目变更与回退留痕原子发生。
    */
   applyRevalidation(
     token: string,
@@ -386,6 +411,8 @@ export class CacheStore {
             outcome: 'already_consumed',
             idempotentReplay: true,
             entry: this.getEntry(tokenRow.cache_key),
+            fallback: readFallback(tokenRow),
+            originStatus: tokenRow.origin_status ?? undefined,
           };
         }
         return {
@@ -396,10 +423,24 @@ export class CacheStore {
       }
 
       const oldEntry = this.getEntry(tokenRow.cache_key);
-      let entry: EntryRow;
-      let outcome: 'updated' | 'not_modified_merged';
 
-      if (input.status === 304) {
+      // RFC 5861：回源得到 500/502/503/504 时，若旧副本仍在 stale-if-error
+      // 窗口内，则保留旧 body 与 headers（不替换条目），仅结束令牌并留痕；
+      // 超窗 / 未声明 / 无旧条目则按普通路径写入错误结果。
+      const fallback = evaluateStaleIfError({
+        oldEntry,
+        originStatus: input.status,
+        originTime: input.originTime,
+      });
+
+      let entry: EntryRow | undefined;
+      let outcome: ApplyRevalidationResult['outcome'];
+
+      if (fallback?.servedStale) {
+        // 保留旧条目原样（含 storedAt），只结束令牌
+        entry = oldEntry;
+        outcome = 'served-stale-if-error';
+      } else if (input.status === 304) {
         if (!oldEntry) {
           throw new RevalidationConflictError('源站返回 304，但缓存中没有可合并的旧响应');
         }
@@ -413,15 +454,32 @@ export class CacheStore {
         outcome = 'updated';
       }
 
+      const summary =
+        fallback && !fallback.servedStale
+          ? `${input.status} ${outcome} (${fallback.reason})`
+          : `${input.status} ${outcome}`;
       this.db
         .prepare(
           `UPDATE tokens
              SET status='consumed', consumed_at=?, payload_hash=?,
-                 result_summary=?
+                 result_summary=?, origin_status=?, fallback_json=?
            WHERE token=?`
         )
-        .run(now, payloadHash, `${input.status} ${outcome}`, token);
-      return { outcome, idempotentReplay: false, entry };
+        .run(
+          now,
+          payloadHash,
+          summary,
+          input.status,
+          fallback ? JSON.stringify(fallback) : null,
+          token
+        );
+      return {
+        outcome,
+        idempotentReplay: false,
+        entry,
+        fallback: fallback ?? null,
+        originStatus: input.status,
+      };
     });
 
     return txn.immediate();
@@ -832,6 +890,13 @@ export class CacheStore {
 function readEtag(responseHeadersJson: string): string | null {
   const headers = JSON.parse(responseHeadersJson) as HeaderMap;
   return headers['etag'] ?? null;
+}
+
+/** 从令牌行读出 stale-if-error 回退记录（无则 null） */
+export function readFallback(tokenRow: TokenRow): StaleFallbackRecord | null {
+  return tokenRow.fallback_json
+    ? (JSON.parse(tokenRow.fallback_json) as StaleFallbackRecord)
+    : null;
 }
 
 /**

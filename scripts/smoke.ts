@@ -653,6 +653,213 @@ async function main(): Promise<void> {
     r.json.summary.ageSamples === 20 && r.json.summary.ageP95Ms === 19_000 &&
     r.json.buckets[0].ageP95Ms === 19_000);
 
+  console.log('\n[18] stale-if-error：回源 5xx 的旧副本顶替');
+
+  // 18.1 窗口内：503 => 保留旧 body/headers，令牌结束，下一次请求可见同一结论
+  await call(app, 'POST', '/admin/entries', {
+    url: 'https://sie.test/ok',
+    status: 200,
+    responseHeaders: { 'cache-control': 'max-age=60, stale-if-error=120', etag: '"sie1"' },
+    body: 'sie-body',
+    storedAt: T0,
+  });
+  // 并发组：领队 + 一个等待者，共享令牌
+  const sieLeaderReq = await call(app, 'POST', '/cache/request', {
+    url: 'https://sie.test/ok',
+    virtualTime: T0 + 100_000,
+    requestId: 'sie-leader',
+  });
+  check('SIE 条目 100s 时 expired 且拿到领队令牌',
+    sieLeaderReq.json.state === 'expired' && sieLeaderReq.json.token?.leader === true);
+  const sieWaiterReq = await call(app, 'POST', '/cache/request', {
+    url: 'https://sie.test/ok',
+    virtualTime: T0 + 100_000,
+    requestId: 'sie-waiter',
+  });
+  check('并发等待者 waiting 且共享同一令牌',
+    sieWaiterReq.json.action === 'waiting' &&
+      sieWaiterReq.json.token.token === sieLeaderReq.json.token.token);
+  const sieToken = sieLeaderReq.json.token.token;
+
+  r = await call(app, 'POST', '/cache/revalidate', {
+    token: sieToken,
+    status: 503,
+    headers: { 'content-type': 'application/json' },
+    body: '{"error":"boom"}',
+    originTime: T0 + 100_000,
+  });
+  check('503 在窗口内 => outcome=served-stale-if-error',
+    r.status === 200 && r.json.outcome === 'served-stale-if-error', r.json);
+  check('保留旧 body 与旧 headers（etag 仍是 sie1）',
+    r.json.entry.body === 'sie-body' && r.json.entry.responseHeaders.etag === '"sie1"' &&
+      r.json.entry.status === 200 && r.json.entry.storedAt === T0);
+  check('staleIfError：servedStale=true、age=100s、窗口 60+120=180s',
+    r.json.staleIfError?.servedStale === true &&
+      r.json.staleIfError.reason === 'served-stale-if-error' &&
+      r.json.staleIfError.ageMs === 100_000 && r.json.staleIfError.ageSeconds === 100 &&
+      r.json.staleIfError.lifetimeMs === 60_000 &&
+      r.json.staleIfError.staleIfErrorMs === 120_000 &&
+      r.json.staleIfError.windowEndMs === 180_000 &&
+      r.json.staleIfError.originStatus === 503);
+  check('staleIfError 自带逐步 trail', Array.isArray(r.json.staleIfError.trail) &&
+    r.json.staleIfError.trail.some((t: any) => t.step === 'stale-if-error'));
+
+  // 幂等重放：同样的 503 再提交一次
+  r = await call(app, 'POST', '/cache/revalidate', {
+    token: sieToken,
+    status: 503,
+    headers: { 'content-type': 'application/json' },
+    body: '{"error":"boom"}',
+    originTime: T0 + 100_000,
+  });
+  check('窗口内 503 重放 => 幂等且带回退记录',
+    r.status === 200 && r.json.idempotentReplay === true &&
+      r.json.staleIfError?.reason === 'served-stale-if-error');
+
+  // 等待者「下一次请求」：旧令牌已结束，成为新领队，trail 可观察上一轮结论
+  const sieRetry = await call(app, 'POST', '/cache/request', {
+    url: 'https://sie.test/ok',
+    virtualTime: T0 + 110_000,
+    requestId: 'sie-waiter-retry',
+  });
+  check('等待者重放：无 pending 令牌 => 新领队',
+    sieRetry.json.token?.leader === true && sieRetry.json.token.token !== sieToken);
+  const priorStep = sieRetry.json.trail.find((t: any) => t.step === 'prior-revalidation');
+  check('trail 含 prior-revalidation 且记录 served-stale-if-error / 503',
+    !!priorStep && priorStep.data.staleIfError?.servedStale === true &&
+      priorStep.data.staleIfError.reason === 'served-stale-if-error' &&
+      priorStep.data.priorOriginStatus === 503 &&
+      priorStep.data.priorHolderRequestId === 'sie-leader', priorStep);
+  check('上一轮结论落库：/cache/decisions 也含该 trail',
+    (await call(app, 'GET', '/cache/decisions?limit=1')).json.decisions[0].trail
+      .some((t: any) => t.step === 'prior-revalidation'));
+  check('GET /cache/tokens?all=1 展示已结束令牌与 staleIfError',
+    (await call(app, 'GET', '/cache/tokens?all=1&limit=50')).json.tokens.some((t: any) =>
+      t.token === sieToken && t.status === 'consumed' && t.originStatus === 503 &&
+      t.staleIfError?.reason === 'served-stale-if-error'));
+  // 新令牌不用于继续提交，释放掉
+  await call(app, 'POST', '/cache/tokens/' + sieRetry.json.token.token + '/release');
+
+  // 18.2 超窗：Age=200s > 60+30=90s => 保留错误结果（502 被写入）
+  await call(app, 'POST', '/admin/entries', {
+    url: 'https://sie.test/late',
+    responseHeaders: { 'cache-control': 'max-age=60, stale-if-error=30' },
+    body: 'late-body',
+    storedAt: T0,
+  });
+  let exp = await call(app, 'POST', '/cache/request', {
+    url: 'https://sie.test/late',
+    virtualTime: T0 + 200_000,
+  });
+  r = await call(app, 'POST', '/cache/revalidate', {
+    token: exp.json.token.token,
+    status: 502,
+    headers: { 'cache-control': 'max-age=60' },
+    body: 'bad-gateway',
+    originTime: T0 + 200_000,
+  });
+  check('超窗 502 => outcome=updated（错误结果落库）',
+    r.json.outcome === 'updated' && r.json.entry.status === 502 &&
+      r.json.entry.body === 'bad-gateway');
+  check('回退原因记录为 window-exceeded，age=200s、上界 90s',
+    r.json.staleIfError?.servedStale === false &&
+      r.json.staleIfError.reason === 'stale-if-error-window-exceeded' &&
+      r.json.staleIfError.ageMs === 200_000 && r.json.staleIfError.windowEndMs === 90_000);
+  // 下一次请求观察到「未回退」的结论（错误条目 max-age=60 已再次过期，需再回源）
+  exp = await call(app, 'POST', '/cache/request', {
+    url: 'https://sie.test/late',
+    virtualTime: T0 + 300_000,
+  });
+  check('超窗后下一轮领队的 prior-revalidation 标记未回退',
+    exp.json.trail.some((t: any) =>
+      t.step === 'prior-revalidation' &&
+      t.data.staleIfError?.reason === 'stale-if-error-window-exceeded' &&
+      t.data.staleIfError?.servedStale === false));
+  await call(app, 'POST', '/cache/tokens/' + exp.json.token.token + '/release');
+
+  // 18.3 无旧条目：miss 回源得 503 => 保留错误结果，原因 entry-missing
+  exp = await call(app, 'POST', '/cache/request', {
+    url: 'https://sie.test/missing',
+    virtualTime: T0,
+  });
+  check('SIE-miss 拿到领队令牌', exp.json.state === 'miss' && exp.json.token?.leader === true);
+  r = await call(app, 'POST', '/cache/revalidate', {
+    token: exp.json.token.token,
+    status: 503,
+    headers: { 'cache-control': 'max-age=60' },
+    body: 'err',
+    originTime: T0,
+  });
+  check('无旧条目 503 => 错误结果落库，原因 stale-if-error-entry-missing',
+    r.json.outcome === 'updated' && r.json.entry.status === 503 &&
+      r.json.staleIfError?.reason === 'stale-if-error-entry-missing' &&
+      r.json.staleIfError.servedStale === false);
+
+  // 18.4 旧条目未声明 stale-if-error => not-declared
+  await call(app, 'POST', '/admin/entries', {
+    url: 'https://sie.test/nodie',
+    responseHeaders: { 'cache-control': 'max-age=60' },
+    body: 'no-sie',
+    storedAt: T0,
+  });
+  exp = await call(app, 'POST', '/cache/request', {
+    url: 'https://sie.test/nodie',
+    virtualTime: T0 + 90_000,
+  });
+  r = await call(app, 'POST', '/cache/revalidate', {
+    token: exp.json.token.token,
+    status: 500,
+    headers: {},
+    body: null,
+    originTime: T0 + 90_000,
+  });
+  check('未声明 SIE 的 500 => 错误结果落库，原因 stale-if-error-not-declared',
+    r.json.outcome === 'updated' && r.json.entry.status === 500 &&
+      r.json.staleIfError?.reason === 'stale-if-error-not-declared');
+
+  // 18.5 边界：恰在窗口上界（age == lifetime+SIE，半闭区间内允许回退）
+  await call(app, 'POST', '/admin/entries', {
+    url: 'https://sie.test/edge',
+    responseHeaders: { 'cache-control': 'max-age=60, stale-if-error=60' },
+    body: 'edge-body',
+    storedAt: T0,
+  });
+  exp = await call(app, 'POST', '/cache/request', {
+    url: 'https://sie.test/edge',
+    virtualTime: T0 + 120_000,
+  });
+  r = await call(app, 'POST', '/cache/revalidate', {
+    token: exp.json.token.token,
+    status: 504,
+    headers: {},
+    body: 'gw',
+    originTime: T0 + 120_000,
+  });
+  check('Age 恰等于上界 120s 仍允许回退（<=）',
+    r.json.outcome === 'served-stale-if-error' && r.json.entry.body === 'edge-body');
+
+  // 18.6 非 SIE 状态码（501）不触发回退判定；2xx 正常替换且 staleIfError=null
+  await call(app, 'POST', '/admin/entries', {
+    url: 'https://sie.test/other',
+    responseHeaders: { 'cache-control': 'max-age=60, stale-if-error=600' },
+    body: 'old',
+    storedAt: T0,
+  });
+  exp = await call(app, 'POST', '/cache/request', {
+    url: 'https://sie.test/other',
+    virtualTime: T0 + 90_000,
+  });
+  r = await call(app, 'POST', '/cache/revalidate', {
+    token: exp.json.token.token,
+    status: 501,
+    headers: { 'cache-control': 'max-age=60' },
+    body: 'nope',
+    originTime: T0 + 90_000,
+  });
+  check('501 不在 500/502/503/504 集合：照常写入、无 staleIfError 记录',
+    r.json.outcome === 'updated' && r.json.entry.status === 501 &&
+      r.json.staleIfError === null);
+
   console.log(`\n结果：${passed} 通过，${failed} 失败`);
   await app.close();
   if (failed > 0) process.exit(1);

@@ -79,6 +79,10 @@ export interface TokenRow {
   method: string | null;
   normalized_url: string | null;
   vary_names: string | null;
+  /** 提交的回源状态码（实际提交值，含 304/5xx；未结束为 null） */
+  origin_status: number | null;
+  /** stale-if-error 回退记录（JSON 字符串）；无回退判定为 null */
+  fallback_json: string | null;
 }
 
 /** entries 表行 */
@@ -95,6 +99,42 @@ export interface EntryRow {
   stored_at: number;
   created_at: number;
   updated_at: number;
+}
+
+/** stale-if-error 回退判定结论 */
+export type StaleIfErrorReason =
+  | 'served-stale-if-error'
+  | 'stale-if-error-window-exceeded'
+  | 'stale-if-error-entry-missing'
+  | 'stale-if-error-not-declared';
+
+/**
+ * 回源得到 5xx 时对 stale-if-error 的判定记录。
+ * 挂在已结束令牌上（tokens.fallback_json），供后续请求/等待者观察同一次结论。
+ */
+export interface StaleFallbackRecord {
+  /** 是否保留并继续服务旧副本 */
+  servedStale: boolean;
+  /** 回退结论代码 */
+  reason: StaleIfErrorReason;
+  /** 人话说明 */
+  detail: string;
+  /** 源站返回的状态码（500/502/503/504） */
+  originStatus: number;
+  /** 判定时刻（取回源 originTime）旧副本的年龄（毫秒，负数钳 0） */
+  ageMs: number;
+  ageSeconds: number;
+  /** 旧副本新鲜寿命（毫秒） */
+  lifetimeMs: number;
+  /** stale-if-error 窗口（毫秒；未声明为 0） */
+  staleIfErrorMs: number;
+  staleIfErrorSeconds: number;
+  /** 可服务窗口上界 lifetime+SIE（毫秒）；无旧条目为 null */
+  windowEndMs: number | null;
+  /** 旧副本的 storedAt；无旧条目为 null */
+  staleStoredAt: number | null;
+  /** 逐步解释轨迹 */
+  trail: TrailStep[];
 }
 
 /** 回源令牌签发结果 */

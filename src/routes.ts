@@ -3,6 +3,7 @@ import {
   CacheStore,
   InvalidationSkip,
   InvalidationTarget,
+  readFallback,
   RevalidationConflictError,
 } from './db';
 import { buildAnalytics } from './analytics';
@@ -245,6 +246,34 @@ export default function registerRoutes(app: FastifyInstance, store: CacheStore):
           conditionalHeaders: issued.row.etag ? { 'if-none-match': issued.row.etag } : {},
         },
       });
+
+      // 并发等待者在领队提交后重新发起请求：此时旧令牌已结束、本次成为新领队，
+      // 把上一轮令牌的 stale-if-error 结论写入轨迹，让等待者观察到同一结果。
+      if (issued.leader) {
+        const prior = store.getLatestClosedToken(keyForRevalidation);
+        if (prior) {
+          const priorFallback = readFallback(prior);
+          trail.push({
+            step: 'prior-revalidation',
+            detail:
+              `该键上一轮回源（由请求 ${prior.request_id} 发起，状态 ${prior.status}）已结束：` +
+              (priorFallback
+                ? priorFallback.servedStale
+                  ? `回源 ${priorFallback.originStatus} 命中 stale-if-error，旧响应被保留并继续服务（age=${priorFallback.ageSeconds}s）`
+                  : `回源 ${priorFallback.originStatus} 未能回退（${priorFallback.reason}），错误结果已保留`
+                : `结果摘要：${prior.result_summary ?? '∅'}`),
+            data: {
+              priorTokenPrefix: prior.token.slice(0, 16),
+              priorHolderRequestId: prior.request_id,
+              priorStatus: prior.status,
+              priorConsumedAt: prior.consumed_at,
+              priorResultSummary: prior.result_summary,
+              priorOriginStatus: prior.origin_status,
+              staleIfError: priorFallback,
+            },
+          });
+        }
+      }
     }
 
     // —— 组装响应 ——
@@ -366,6 +395,8 @@ export default function registerRoutes(app: FastifyInstance, store: CacheStore):
           idempotentReplay: true,
           token: tokenRow.token,
           status: tokenRow.status,
+          originStatus: tokenRow.origin_status,
+          staleIfError: readFallback(tokenRow),
           resultSummary: tokenRow.result_summary,
           entry: serializeEntry(store.getEntry(tokenRow.cache_key)),
           message: '相同回源结果重复提交，已按幂等处理',
@@ -400,11 +431,17 @@ export default function registerRoutes(app: FastifyInstance, store: CacheStore):
       idempotentReplay: false,
       token,
       cacheKey: tokenRow.cache_key,
+      originStatus: result.originStatus,
+      staleIfError: result.fallback ?? null,
       entry: serializeEntry(result.entry),
       message:
         result.outcome === 'not_modified_merged'
           ? '源站返回 304：已将新响应头合并到旧条目，body 与状态码沿用旧响应，storedAt 更新为 originTime'
-          : '缓存已用回源响应替换；等待中的并发请求现在可以重新发起判定',
+          : result.outcome === 'served-stale-if-error'
+            ? '源站返回 5xx 且旧副本仍在 stale-if-error 窗口内：保留旧 body 与 headers，令牌已结束，等待者可重放观察同一结果'
+            : result.fallback
+              ? result.fallback.detail + '；令牌已结束'
+              : '缓存已用回源响应替换；等待中的并发请求现在可以重新发起判定',
     });
   });
 
@@ -427,7 +464,9 @@ export default function registerRoutes(app: FastifyInstance, store: CacheStore):
     const q = req.query as { all?: string; limit?: string };
     const limit = clampLimit(q.limit);
     return {
-      tokens: store.listTokens(q.all === '1' || q.all === 'true', limit),
+      tokens: store
+        .listTokens(q.all === '1' || q.all === 'true', limit)
+        .map(serializeToken),
     };
   });
 
@@ -868,6 +907,27 @@ function serializeEntry(entry: EntryRow | undefined): unknown {
     storedAt: entry.stored_at,
     createdAt: entry.created_at,
     updatedAt: entry.updated_at,
+  };
+}
+
+/** 令牌序列化：把 stale-if-error 回退记录一并解析出来 */
+function serializeToken(token: import('./types').TokenRow): unknown {
+  return {
+    token: token.token,
+    cacheKey: token.cache_key,
+    reason: token.reason,
+    issuedAt: token.issued_at,
+    requestId: token.request_id,
+    status: token.status,
+    etag: token.etag,
+    payloadHash: token.payload_hash,
+    consumedAt: token.consumed_at,
+    resultSummary: token.result_summary,
+    method: token.method,
+    normalizedUrl: token.normalized_url,
+    varyNames: token.vary_names ? JSON.parse(token.vary_names) : null,
+    originStatus: token.origin_status,
+    staleIfError: readFallback(token),
   };
 }
 
