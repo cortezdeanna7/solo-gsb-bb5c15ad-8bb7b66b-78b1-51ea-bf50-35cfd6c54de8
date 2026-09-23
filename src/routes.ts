@@ -76,7 +76,7 @@ export default function registerRoutes(app: FastifyInstance, store: CacheStore):
     instanceId: store.getInstanceId(),
     endpoints: {
       'POST /cache/request': '携带虚拟时间发起一次缓存请求',
-      'POST /cache/revalidate': '凭回源令牌提交源站结果（幂等）',
+      'POST /cache/revalidate': '凭回源令牌提交源站结果（幂等；5xx 按 stale-if-error 窗口回退旧响应或保留错误结果）',
       'POST /cache/tokens/:token/release': '放弃令牌',
       'GET  /cache/tokens': '查看令牌（?all=1 含已结束）',
       'GET  /cache/entries': '查看缓存条目',
@@ -393,6 +393,52 @@ export default function registerRoutes(app: FastifyInstance, store: CacheStore):
 
     if (result.conflict) {
       throw new RevalidationHttpError(409, result.conflict);
+    }
+
+    // —— 5xx 提交：stale-if-error 回退判定（回退旧响应，或保留错误结果）——
+    if (result.staleIfError) {
+      const sie = result.staleIfError;
+      // 留痕：回退原因 / 年龄 / trail 落库，并发等待者与审计可经
+      // GET /cache/decisions 观察到与领队响应一致的同一结果
+      const decisionId = store.insertDecisionLog({
+        requestId: tokenRow.request_id,
+        virtualTime: originTime,
+        method: tokenRow.method ?? 'GET',
+        url: tokenRow.normalized_url ?? '(unknown)',
+        normalizedUrl: tokenRow.normalized_url,
+        cacheKey: tokenRow.cache_key,
+        state: 'stale-if-error',
+        action: sie.serveStale ? 'served-stale-if-error' : 'stored-error-response',
+        token: tokenRow.token,
+        trail: sie.trail,
+        now: Date.now(),
+      });
+      return reply.code(200).send({
+        outcome: result.outcome,
+        idempotentReplay: false,
+        token,
+        cacheKey: tokenRow.cache_key,
+        entry: serializeEntry(result.entry),
+        staleIfError: {
+          status,
+          serveStale: sie.serveStale,
+          reason: sie.reason,
+          reasonText: STALE_IF_ERROR_REASON_TEXT[sie.reason] ?? sie.reason,
+          ageMs: sie.ageMs,
+          ageSeconds: sie.ageMs === null ? null : Math.floor(sie.ageMs / 1000),
+          lifetimeMs: sie.lifetimeMs,
+          stalenessMs: sie.stalenessMs,
+          sieMs: sie.sieMs,
+          windowEndMs: sie.windowEndMs,
+          decisionId,
+          trail: sie.trail,
+        },
+        message: sie.serveStale
+          ? `源站 ${status}（5xx）：旧条目仍在 stale-if-error 窗口内，保留旧 body 与 headers 服务；` +
+            `令牌已完成，回退判定已留痕 #${decisionId}（GET /cache/decisions），并发等待者下次请求可观察同一结果`
+          : `源站 ${status}（5xx）：${STALE_IF_ERROR_REASON_TEXT[sie.reason] ?? sie.reason}，` +
+            `已保留错误结果并结束令牌；判定已留痕 #${decisionId}（GET /cache/decisions）`,
+      });
     }
 
     return reply.code(200).send({
@@ -749,6 +795,15 @@ export default function registerRoutes(app: FastifyInstance, store: CacheStore):
 }
 
 // —— helpers ——
+
+/** stale-if-error 回退原因码 => 人话解释（响应 reasonText 与 message 共用） */
+const STALE_IF_ERROR_REASON_TEXT: Record<string, string> = {
+  'within-window': '旧条目仍在 stale-if-error 窗口内',
+  'window-exceeded': '旧条目已超出 stale-if-error 窗口',
+  'no-stale-if-error-directive': '旧条目未声明 stale-if-error',
+  'no-old-entry': '缓存中没有可回退的旧条目',
+  'not-an-error': '回源状态不是 5xx',
+};
 
 interface LookupResult {
   entry: EntryRow | undefined;

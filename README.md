@@ -5,6 +5,7 @@
 - 预置带 `Cache-Control`、`ETag`、`Vary` 与**存入时间**的模拟响应；
 - 携带**虚拟时间**发起请求，观察缓存按 `fresh` / `stale-while-revalidate` / `expired` 的判定；
 - 观察并发请求命中同一需回源键时的**单飞回源令牌**（single-flight token）编排；
+- 回源提交 **5xx** 时按 **stale-if-error** 窗口回退旧响应（保留旧 body/headers、完成令牌、原因+年龄+trail 全程留痕）；
 - 逐步核对每次判定输出的**解释轨迹**（trail）；
 - 按方法 + URL + 请求头**精确解析 Vary 变体**做**条件失效**（ETag 守卫、dryRun 预览、释放 pending 令牌、全程留痕）；
 - 按虚拟时间区间把历史判定分桶聚合（状态计数、Age p95、单飞领队率），观测缓存表现；
@@ -46,7 +47,7 @@ npm ci
 npm run build
 DB_PATH=./data/lab.db npm start          # 生产模式
 DB_PATH=:memory: npm run dev             # 开发模式（内存库）
-npm run smoke                            # 131 项端到端断言
+npm run smoke                            # 152 项端到端断言
 ```
 
 环境变量：
@@ -208,6 +209,82 @@ curl -s 'localhost:8080/admin/invalidations?limit=10'
 
 ---
 
+## 端到端示例：回源 5xx 触发 stale-if-error 回退
+
+预置 `max-age=60, stale-if-error=30` 的条目。过期后领队回源拿到 503：旧副本 staleness（15s）仍在 30s 窗口内，缓存**保留旧 body 与 headers**；超过窗口则**保留错误结果**。
+
+```bash
+T0=1767225600000
+
+# 1) 预置 max-age=60、stale-if-error=30 的条目
+curl -s -X POST localhost:8080/admin/entries -H 'content-type: application/json' -d '{
+  "url": "https://api.example.test/feed",
+  "responseHeaders": { "cache-control": "max-age=60, stale-if-error=30", "etag": "\"v1\"" },
+  "body": "{\"v\":1}",
+  "storedAt": '$T0'
+}' >/dev/null
+
+# 2) t+75s：已过期（无 SWR），领队拿到回源令牌；并发请求进入 waiting
+curl -s -X POST localhost:8080/cache/request -H 'content-type: application/json' -d '{
+  "url": "https://api.example.test/feed", "virtualTime": '$((T0+75000))'
+}'
+# => state=expired, action=must-revalidate, token=Tok…
+
+# 3) 源站 503：staleness = 75-60 = 15s ≤ 30s => 窗口内，回退旧响应
+curl -s -X POST localhost:8080/cache/revalidate -H 'content-type: application/json' -d '{
+  "token": "Tok…", "status": 503, "body": "upstream error",
+  "originTime": '$((T0+75000))'
+}'
+```
+
+第 3 步响应（节选）：
+
+```json
+{
+  "outcome": "served-stale-if-error",
+  "entry": { "status": 200, "body": "{\"v\":1}", "storedAt": 1767225600000 },
+  "staleIfError": {
+    "status": 503,
+    "serveStale": true,
+    "reason": "within-window",
+    "ageMs": 75000,
+    "lifetimeMs": 60000,
+    "stalenessMs": 15000,
+    "sieMs": 30000,
+    "windowEndMs": 90000,
+    "decisionId": 2,
+    "trail": [ /* age → lifetime → stale-if-error 逐步解释 */ ]
+  }
+}
+```
+
+条目**未被 503 覆盖**：旧 body/headers/storedAt 原样保留，令牌已 `consumed`。回退判定同时落库，并发等待者与审计都能回看同一结果：
+
+```bash
+# 4) 观察回退留痕与令牌终态
+curl -s 'localhost:8080/cache/decisions?limit=5'
+#   state=stale-if-error, action=served-stale-if-error（含完整 trail）
+curl -s 'localhost:8080/cache/tokens?all=1'
+#   result_summary="503 served-stale-if-error (staleness 15s <= sie 30s)"
+
+# 5) 等待者下一次请求：旧条目仍在（未被 503 覆盖），仍过期 => 重新签发令牌
+curl -s -X POST localhost:8080/cache/request -H 'content-type: application/json' -d '{
+  "url": "https://api.example.test/feed", "virtualTime": '$((T0+95000))'
+}'
+# => state=expired, 新令牌 Tok2…
+
+# 6) 超窗：staleness = 95-60 = 35s > 30s => 保留错误结果并结束令牌
+curl -s -X POST localhost:8080/cache/revalidate -H 'content-type: application/json' -d '{
+  "token": "Tok2…", "status": 503, "body": "upstream error",
+  "originTime": '$((T0+95000))'
+}'
+# => outcome=updated, staleIfError.reason=window-exceeded，条目被 503 错误结果替换
+```
+
+窗口语义与 SWR 一致（RFC 5861「不超过 N 秒陈旧」）：`staleness = age − lifetime ≤ stale-if-error`，即 `age ≤ lifetime + stale-if-error`。旧条目未声明 `stale-if-error`、或缓存中已没有旧条目时，5xx 结果直接写入条目（`outcome=updated`，`staleIfError.reason` 分别为 `no-stale-if-error-directive` / `no-old-entry`）。
+
+---
+
 ## 端到端示例：按虚拟时间桶分析判定
 
 先制造一批分布在不同虚拟时间的请求，再用 `POST /cache/analytics` 聚合（也可以直接用上面演练产生的判定）：
@@ -324,6 +401,7 @@ curl -s -X POST localhost:8080/cache/analytics -H 'content-type: application/jso
 - 查询区间是**半开** `[virtualFrom, virtualTo)`：恰在 `virtualFrom` 的判定计入，恰在 `virtualTo` 的不计入；桶也是半开 `[bucketStart, bucketEnd)`。
 - 桶网格以 **`virtualFrom` 为原点**对齐（第 k 个桶起点 = `virtualFrom + k·bucketSeconds`），结果按桶起点升序、**空桶也输出**（计数补 0、`ageP95Ms`/`leaderRate` 为 `null`）。区间长度不是桶宽整数倍时，尾桶按 `virtualTo` 截断并标 `"partial": true`。桶数上限 10000，超出返回 400。
 - `counts` 固定七键：`fresh` / `stale-while-revalidate` / `stale` / `expired` / `miss` / `bypass` / `gateway-timeout`。
+- 回源 5xx 的 stale-if-error 判定也会落库（`state=stale-if-error`）：计入 `total`/`matchedRows` 与 Age 样本，但不属于上述七种请求状态、不参与单飞统计。
 - **Age p95**：只有真实命中缓存副本的判定有 Age（取自落库轨迹的 `age.ageMs`，毫秒；miss/bypass/gateway-timeout 不是 Age 样本）。采用**最近邻排名**（nearest-rank）：升序后取第 `ceil(0.95 × n)` 个样本；桶内无 Age 样本时为 `null`，并同时给出向下取整的 `ageP95Seconds`。
 - **单飞领队率** `leaderRate = leaders / singleFlight`：凡拿到回源令牌的判定（SWR 领队/加入、miss/expired/bypass 的领队/等待）都计入 `singleFlight`，角色以令牌轨迹中的 `leader` 为准（同键并发组只有 1 个领队）；桶内没有单飞判定时为 `null`。
 - `urlPrefix` 可选：给完整 `http(s)://` URL 时按与缓存键相同的规则**规范化后再前缀匹配**（大写 host、乱序 query 等都归一）；否则当作规范化 URL 的字面前缀（如 `https://api.example.test/v1/`，可按 host/目录聚合）。
@@ -373,7 +451,7 @@ Vary 变体查找：先按「方法 + 规范化 URL」筛候选条目，再用�
 
 新鲜寿命优先级：`s-maxage` > `max-age` > `Expires - storedAt` > 启发式 `10% × (storedAt - Last-Modified)` > `0`。
 
-强制再验证开关：响应 `no-cache`、`must-revalidate`、`proxy-revalidate`，以及请求 `max-age` 被 Age 超过时，**禁止任何陈旧服务**（SWR 也不行）。请求侧还支持 `min-fresh`、`max-stale[=Δ]`、`only-if-cached`、`no-store`。响应侧另解析 `stale-if-error`（仅记录，因本服务不自动回源）。
+强制再验证开关：响应 `no-cache`、`must-revalidate`、`proxy-revalidate`，以及请求 `max-age` 被 Age 超过时，**禁止任何陈旧服务**（SWR 也不行）。请求侧还支持 `min-fresh`、`max-stale[=Δ]`、`only-if-cached`、`no-store`。响应侧另解析 `stale-if-error`：回源提交 5xx 时按窗口回退旧响应（见「提交回源结果」与专节示例）。
 
 ### 单飞回源令牌
 
@@ -396,6 +474,7 @@ Vary 变体查找：先按「方法 + 规范化 URL」筛候选条目，再用�
 - 令牌已结束但内容不同 → **409**（拒绝覆盖）；
 - 令牌 pending → 原子地写入新响应并把令牌置为 `consumed`；
 - 提交 `status: 304` → 按 RFC 9111 合并：新响应头逐头覆盖旧头，body 与状态码沿用旧响应，`storedAt` 更新为 `originTime`；
+- 提交 **5xx**（500–599）→ **stale-if-error 判定**：旧条目 `staleness ≤ stale-if-error` 秒数时**保留旧 body 与 headers**（`outcome=served-stale-if-error`，条目不动）；超窗、未声明 `stale-if-error` 或无旧条目时**保留错误结果**（写入条目，`outcome=updated`）。两种情形令牌都置 `consumed`，回退原因、年龄与 trail 落库（`state=stale-if-error`），并发等待者下次请求可经 `GET /cache/decisions` 观察同一结果；
 - 回源响应的 `Vary` 集合与缓存键不一致 → **409**（演练要求变体结构稳定）。
 
 等待方在领队提交后，**重新发起** `/cache/request`（带新的虚拟时间）即可看到新响应。若领队放弃回源，调用 `POST /cache/tokens/:token/release` 释放令牌，同键才能签发新令牌。
@@ -499,6 +578,13 @@ Vary 变体查找：先按「方法 + 规范化 URL」筛候选条目，再用�
 
 `responseHeaders` 与 `headers` 二者皆可（后者优先）；`body` 为字符串或 `null`。
 
+提交 **5xx**（500–599）时触发 stale-if-error 判定，响应额外携带 `staleIfError` 对象：
+
+- 旧条目 `staleness ≤ stale-if-error` 秒数 → `outcome=served-stale-if-error`：保留旧 body 与 headers（条目不动），令牌 `consumed`；
+- 超窗 / 未声明 / 无旧条目 → `outcome=updated`：错误结果写入条目，令牌 `consumed`。
+
+`staleIfError` 字段：`serveStale`、`reason`（`within-window` / `window-exceeded` / `no-stale-if-error-directive` / `no-old-entry`）与 `reasonText`、`ageMs` / `ageSeconds` / `lifetimeMs` / `stalenessMs` / `sieMs` / `windowEndMs`、`decisionId`（落库判定 ID）与逐步 `trail`。判定同时以 `state=stale-if-error` 写入 `decision_logs`（`GET /cache/decisions` 可查），令牌 `result_summary` 记录同一结论。
+
 ### `POST /admin/invalidate`
 
 按「方法 + 规范化 URL + 请求头」**精确解析 Vary 变体**后做条件失效。变体解析规则与 `/cache/request` 完全一致：先按方法 + 规范化 URL 取候选，再用候选**响应自身的 `Vary`** 结合本次 `headers` 计算缓存键——因此只会失效请求头真正选中的那个变体，同 URL 的兄弟变体不动。
@@ -579,6 +665,7 @@ curl -s 'localhost:8080/admin/invalidations?limit=20'
 5. **Vary 变体**：预置同一 URL 的 `gzip` / `br` 两个变体，换请求头观察键材料与命中差异。
 6. **URL 规范化**：用乱序 query、大小写 host、默认端口、fragment 等形式请求同一资源，对比 `normalizedUrl` 与 `cacheKey`。
 7. **条件失效**：预置 `gzip` / `br` 两个 ETag 不同的变体 → 先 `dryRun` 确认只选中 gzip 且 br 出现在 `variant-miss` → 用错误的 `expectedEtag` 执行被 `etag-mismatch` 拦下 → 用正确 ETag 执行后确认 gzip 删除、br 仍命中、pending 令牌被释放。
+8. **stale-if-error 回退**：预置 `max-age=60, stale-if-error=30` 条目 → 过期后领队回源提交 503（窗口内）→ 确认旧条目原样保留、令牌 `consumed`、判定落库 → 等待者重发请求再次回源 → 提交超窗 503 → 确认错误结果写入条目。
 
 ---
 
@@ -588,7 +675,7 @@ curl -s 'localhost:8080/admin/invalidations?limit=20'
 - **不主动发起真实回源**：服务只模拟缓存层，「源站响应」由客户端通过令牌提交，时间线完全可控、可重放。
 - **等待不阻塞连接**：`waiting` 是立即返回的状态对象而非长轮询，方便在脚本/测试中显式编排并发组。
 - **Vary 结构稳定**：回源响应不得改变 `Vary` 字段集合（返回 409）；真实缓存中这等价于换键，需要重新填充。
-- **不模拟的部分**：请求折叠时的 `Pragma`、`stale-if-error` 的自动 5xx 回退（仅轨迹提示）、共享/私有缓存授权语义（`private` 被解析但不拦截存储，便于自由演练）。
+- **不模拟的部分**：请求折叠时的 `Pragma`、共享/私有缓存授权语义（`private` 被解析但不拦截存储，便于自由演练）。
 
 ## 项目结构
 
@@ -596,12 +683,12 @@ curl -s 'localhost:8080/admin/invalidations?limit=20'
 src/
   index.ts          Fastify 启动与错误处理
   routes.ts         HTTP 端点与单飞编排
-  freshness.ts      纯函数：新鲜度判定与轨迹生成
+  freshness.ts      纯函数：新鲜度判定、stale-if-error 回退判定与轨迹生成
   analytics.ts      纯函数：判定日志的时间桶聚合（状态计数 / Age p95 / 领队率）
   canonical.ts      URL 规范化、Vary 解析、缓存键计算
   cache-control.ts  Cache-Control 指令解析（请求/响应共用）
   http-date.ts      IMF-fixdate / RFC850 / asctime 解析与格式化
   db.ts             SQLite 表、条目写入、原子令牌签发与提交、条件失效事务
   util.ts           时间/头/指纹等工具
-scripts/smoke.ts    端到端断言（131 项）
+scripts/smoke.ts    端到端断言（152 项）
 ```

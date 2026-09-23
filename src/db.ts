@@ -3,6 +3,11 @@ import { randomUUID } from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import type { AnalyticsDecisionRow } from './analytics';
+import {
+  evaluateStaleIfError,
+  isStaleIfErrorStatus,
+  StaleIfErrorEvaluation,
+} from './freshness';
 import { EntryRow, HeaderMap, TokenRow } from './types';
 import { generateToken, sha256, stableStringify } from './util';
 
@@ -27,10 +32,12 @@ export interface RevalidationInput {
 }
 
 export interface ApplyRevalidationResult {
-  outcome: 'updated' | 'not_modified_merged' | 'already_consumed';
+  outcome: 'updated' | 'not_modified_merged' | 'already_consumed' | 'served-stale-if-error';
   idempotentReplay: boolean;
   conflict?: string;
   entry?: EntryRow;
+  /** 5xx 提交时的 stale-if-error 回退判定（原因、年龄与 trail，供响应与留痕使用） */
+  staleIfError?: StaleIfErrorEvaluation;
 }
 
 /** 失效计划中「Vary 变体已精确命中」的目标键 */
@@ -359,6 +366,9 @@ export class CacheStore {
    * - 相同 payloadHash 重复提交 => 幂等成功（idempotentReplay=true）
    * - 不同 payloadHash => 409，不修改任何数据
    * - status=304 时与缓存中的旧响应合并
+   * - status 为 5xx 时按 stale-if-error 判定：窗口内保留旧 body/headers
+   *   （条目不动，outcome=served-stale-if-error）；超窗 / 未声明 / 无旧条目
+   *   则保留错误结果（写入条目，outcome=updated）。两种情形都结束令牌。
    *
    * 整个过程在一个事务中完成：令牌置 consumed 与条目更新原子发生。
    */
@@ -396,6 +406,41 @@ export class CacheStore {
       }
 
       const oldEntry = this.getEntry(tokenRow.cache_key);
+
+      // —— 5xx：stale-if-error 回退判定（RFC 5861）——
+      if (isStaleIfErrorStatus(input.status)) {
+        const sie = evaluateStaleIfError({
+          status: input.status,
+          originTime: input.originTime,
+          entry: oldEntry,
+        });
+        if (sie.serveStale && oldEntry) {
+          // 窗口内：保留旧 body 与 headers（条目不动），仅结束令牌
+          this.consumeToken(
+            token,
+            now,
+            payloadHash,
+            `${input.status} served-stale-if-error ` +
+              `(staleness ${Math.floor((sie.stalenessMs ?? 0) / 1000)}s <= sie ${Math.floor(sie.sieMs / 1000)}s)`
+          );
+          return {
+            outcome: 'served-stale-if-error',
+            idempotentReplay: false,
+            entry: oldEntry,
+            staleIfError: sie,
+          };
+        }
+        // 超窗 / 未声明 / 无旧条目：保留错误结果（按普通回源覆盖条目），结束令牌
+        const entry = this.replaceFromOrigin(tokenRow, input, now);
+        this.consumeToken(
+          token,
+          now,
+          payloadHash,
+          `${input.status} stored (stale-if-error: ${sie.reason})`
+        );
+        return { outcome: 'updated', idempotentReplay: false, entry, staleIfError: sie };
+      }
+
       let entry: EntryRow;
       let outcome: 'updated' | 'not_modified_merged';
 
@@ -413,18 +458,23 @@ export class CacheStore {
         outcome = 'updated';
       }
 
-      this.db
-        .prepare(
-          `UPDATE tokens
-             SET status='consumed', consumed_at=?, payload_hash=?,
-                 result_summary=?
-           WHERE token=?`
-        )
-        .run(now, payloadHash, `${input.status} ${outcome}`, token);
+      this.consumeToken(token, now, payloadHash, `${input.status} ${outcome}`);
       return { outcome, idempotentReplay: false, entry };
     });
 
     return txn.immediate();
+  }
+
+  /** 事务内把 pending 令牌置为 consumed，并记录载荷指纹与结果摘要 */
+  private consumeToken(token: string, now: number, payloadHash: string, summary: string): void {
+    this.db
+      .prepare(
+        `UPDATE tokens
+           SET status='consumed', consumed_at=?, payload_hash=?,
+               result_summary=?
+         WHERE token=?`
+      )
+      .run(now, payloadHash, summary, token);
   }
 
   /**

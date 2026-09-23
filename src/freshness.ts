@@ -47,7 +47,11 @@ export interface FreshnessResult {
 }
 
 const CACHEABLE_METHODS = new Set(['GET', 'HEAD']);
-const STALE_OVERRIDE_STATUS = new Set([500, 502, 503, 504]);
+
+/** stale-if-error 可回退的源站错误：任意 5xx（RFC 5861 列举 500/502/503/504） */
+export function isStaleIfErrorStatus(status: number): boolean {
+  return status >= 500 && status < 600;
+}
 
 /**
  * 纯函数：给定缓存条目（可能不存在）与带虚拟时间的请求，产出状态与解释轨迹。
@@ -348,15 +352,15 @@ export function evaluateFreshness(input: FreshnessInputs): FreshnessResult {
     });
   }
 
-  // 3) 5xx 陈旧副本 + stale-if-error（仅当源站错误时才可用；演练里记录为不可自动服务）
+  // 3) 5xx 陈旧副本 + stale-if-error：回源出错时的回退窗口（在 /cache/revalidate 提交时判定）
   const sieMs =
     responseCC['stale-if-error'] !== undefined ? responseCC['stale-if-error'] * 1000 : 0;
   if (sieMs > 0) {
     trail.push({
       step: 'stale-if-error',
       detail:
-        `响应带 stale-if-error=${responseCC['stale-if-error']}s：仅当回源得到 ` +
-        `${[...STALE_OVERRIDE_STATUS].join('/')} 时才可服务（上限 ${sieMs}ms）；当前尚未回源，先回源`,
+        `响应带 stale-if-error=${responseCC['stale-if-error']}s：回源若得到 5xx，` +
+        `提交结果时旧副本 staleness ≤ ${sieMs}ms 即可回退服务旧响应（见 /cache/revalidate）；当前尚未回源，先回源`,
     });
   }
 
@@ -383,7 +387,7 @@ export function evaluateFreshness(input: FreshnessInputs): FreshnessResult {
  * 新鲜寿命（毫秒），优先级：
  *   s-maxage > max-age > Expires > 启发式（10% × (storedAt - Last-Modified)）> 0
  */
-function computeLifetime(
+export function computeLifetime(
   headers: HeaderMap,
   cc: CacheControlDirectives,
   storedAt: number,
@@ -477,4 +481,155 @@ function sanitizeCC(cc: CacheControlDirectives): Record<string, unknown> {
     if (v !== undefined) out[k] = v;
   }
   return out;
+}
+
+// —— stale-if-error：回源 5xx 时的旧副本回退判定 ——
+
+export type StaleIfErrorReason =
+  /** staleness ≤ stale-if-error 窗口：回退旧响应 */
+  | 'within-window'
+  /** 超出 stale-if-error 窗口：不得回退 */
+  | 'window-exceeded'
+  /** 旧条目未声明 stale-if-error */
+  | 'no-stale-if-error-directive'
+  /** 缓存中没有可回退的旧条目 */
+  | 'no-old-entry'
+  /** 回源状态不是 5xx，本判定不适用 */
+  | 'not-an-error';
+
+export interface StaleIfErrorEvaluation {
+  /** true = 保留旧 body 与 headers 服务（条目不动），false = 保留错误结果 */
+  serveStale: boolean;
+  /** 回退 / 拒绝回退的原因码 */
+  reason: StaleIfErrorReason;
+  /** 旧条目在 originTime 的年龄（毫秒）；无旧条目为 null */
+  ageMs: number | null;
+  /** 旧条目的新鲜寿命（毫秒）；无旧条目为 null */
+  lifetimeMs: number | null;
+  /** 陈旧度 = max(0, ageMs - lifetimeMs)；无旧条目为 null */
+  stalenessMs: number | null;
+  /** 响应声明的 stale-if-error 窗口（毫秒）；未声明为 0 */
+  sieMs: number;
+  /** 回退窗口上界（age 不超过该值即可回退）= lifetimeMs + sieMs；无旧条目/未声明为 null */
+  windowEndMs: number | null;
+  /** 逐步解释轨迹（age / lifetime / stale-if-error 判定） */
+  trail: TrailStep[];
+}
+
+/**
+ * 纯函数：回源结果为 5xx 时，判定旧条目是否仍在 stale-if-error 回退窗口内。
+ *
+ * 窗口语义与 SWR 一致（RFC 5861「不超过 N 秒陈旧」）：
+ *   staleness = age - lifetime ≤ stale-if-error 秒数
+ *   即 age ≤ lifetime + sieMs
+ *
+ * 不读写数据库——是否保留旧条目 / 写入错误结果由调用方在事务内执行。
+ */
+export function evaluateStaleIfError(input: {
+  status: number;
+  originTime: number;
+  entry: EntryRow | undefined;
+}): StaleIfErrorEvaluation {
+  const trail: TrailStep[] = [];
+  const { status, originTime, entry } = input;
+
+  if (!isStaleIfErrorStatus(status)) {
+    trail.push({
+      step: 'stale-if-error',
+      detail: `回源状态 ${status} 不是 5xx 错误：stale-if-error 不适用`,
+      data: { reason: 'not-an-error', status },
+    });
+    return evaluation(false, 'not-an-error', null, null, null, 0, null, trail);
+  }
+
+  trail.push({
+    step: 'stale-if-error-check',
+    detail: `回源结果为 ${status}（5xx）：检查旧条目是否仍在 stale-if-error 回退窗口内`,
+    data: { status, originTime },
+  });
+
+  if (!entry) {
+    trail.push({
+      step: 'stale-if-error',
+      detail: '缓存中没有可回退的旧条目（未命中或已被失效/重置）：保留错误结果',
+      data: { reason: 'no-old-entry' },
+    });
+    return evaluation(false, 'no-old-entry', null, null, null, 0, null, trail);
+  }
+
+  const responseHeaders = JSON.parse(entry.response_headers) as HeaderMap;
+  const { directives: responseCC } = parseCacheControl(responseHeaders['cache-control']);
+  const sieMs =
+    responseCC['stale-if-error'] !== undefined ? responseCC['stale-if-error'] * 1000 : 0;
+
+  // 与 /cache/request 同口径：先记录 Age 与寿命，再判定窗口
+  const ageMs = Math.max(0, originTime - entry.stored_at);
+  trail.push({
+    step: 'age',
+    detail: `旧条目 Age = originTime(${originTime}) - storedAt(${entry.stored_at}) = ${ageMs} ms（负数钳为 0）`,
+    data: {
+      originTime,
+      storedAt: entry.stored_at,
+      ageMs,
+      ageSeconds: Math.floor(ageMs / 1000),
+    },
+  });
+  const lifetimeMs = computeLifetime(responseHeaders, responseCC, entry.stored_at, trail).lifetimeMs;
+  const stalenessMs = Math.max(0, ageMs - lifetimeMs);
+
+  if (sieMs <= 0) {
+    trail.push({
+      step: 'stale-if-error',
+      detail: `旧条目未声明 stale-if-error（Cache-Control: ${responseCC.raw ?? '∅'}）：不得回退，保留错误结果`,
+      data: {
+        reason: 'no-stale-if-error-directive',
+        cacheControl: responseCC.raw ?? null,
+        ageMs,
+        stalenessMs,
+      },
+    });
+    return evaluation(false, 'no-stale-if-error-directive', ageMs, lifetimeMs, stalenessMs, 0, null, trail);
+  }
+
+  const windowEndMs = lifetimeMs + sieMs;
+  const serveStale = stalenessMs <= sieMs;
+  trail.push({
+    step: 'stale-if-error',
+    detail: serveStale
+      ? `staleness = age(${ageMs}ms) - lifetime(${lifetimeMs}ms) = ${stalenessMs}ms ≤ stale-if-error=${sieMs}ms：` +
+        `在回退窗口内（age 上界 ${windowEndMs}ms），保留旧 body 与 headers 服务`
+      : `staleness = age(${ageMs}ms) - lifetime(${lifetimeMs}ms) = ${stalenessMs}ms 已超过 stale-if-error=${sieMs}ms ` +
+        `（窗口上界 age ≤ ${windowEndMs}ms）：不得回退，保留错误结果`,
+    data: {
+      reason: serveStale ? 'within-window' : 'window-exceeded',
+      ageMs,
+      lifetimeMs,
+      stalenessMs,
+      sieMs,
+      windowEndMs,
+    },
+  });
+  return evaluation(
+    serveStale,
+    serveStale ? 'within-window' : 'window-exceeded',
+    ageMs,
+    lifetimeMs,
+    stalenessMs,
+    sieMs,
+    windowEndMs,
+    trail
+  );
+}
+
+function evaluation(
+  serveStale: boolean,
+  reason: StaleIfErrorReason,
+  ageMs: number | null,
+  lifetimeMs: number | null,
+  stalenessMs: number | null,
+  sieMs: number,
+  windowEndMs: number | null,
+  trail: TrailStep[]
+): StaleIfErrorEvaluation {
+  return { serveStale, reason, ageMs, lifetimeMs, stalenessMs, sieMs, windowEndMs, trail };
 }

@@ -653,6 +653,99 @@ async function main(): Promise<void> {
     r.json.summary.ageSamples === 20 && r.json.summary.ageP95Ms === 19_000 &&
     r.json.buckets[0].ageP95Ms === 19_000);
 
+  console.log('\n[18] stale-if-error：回源 5xx 时回退旧响应 / 保留错误结果');
+  await call(app, 'POST', '/admin/reset');
+  await call(app, 'POST', '/admin/entries', {
+    url: 'https://sie.test/a',
+    responseHeaders: { 'cache-control': 'max-age=60, stale-if-error=30', etag: '"s1"' },
+    body: 'sie-body',
+    storedAt: T0,
+  });
+  // t+75s：已过期（无 SWR），领队拿令牌回源；并发请求进入等待
+  r = await call(app, 'POST', '/cache/request', { url: 'https://sie.test/a', virtualTime: T0 + 75_000 });
+  check('过期条目领队拿到回源令牌', r.json.action === 'must-revalidate' && r.json.token?.leader === true);
+  const sieToken = r.json.token.token;
+  const sieWaiter = await call(app, 'POST', '/cache/request', { url: 'https://sie.test/a', virtualTime: T0 + 76_000 });
+  check('并发请求进入 waiting 且共享同一令牌', sieWaiter.json.action === 'waiting' && sieWaiter.json.token.token === sieToken);
+  // 回源 503：staleness = 75s - 60s = 15s ≤ 30s => 窗口内，回退旧响应
+  const sie503 = {
+    token: sieToken, status: 503,
+    headers: { 'content-type': 'text/plain' }, body: 'err',
+    originTime: T0 + 75_000,
+  };
+  r = await call(app, 'POST', '/cache/revalidate', sie503);
+  check('503 且窗口内 => outcome=served-stale-if-error', r.status === 200 && r.json.outcome === 'served-stale-if-error', r.json);
+  check('回退信息：reason=within-window、age=75s、staleness=15s、窗口上界 90s',
+    r.json.staleIfError?.reason === 'within-window' && r.json.staleIfError.ageMs === 75_000 &&
+    r.json.staleIfError.stalenessMs === 15_000 && r.json.staleIfError.sieMs === 30_000 &&
+    r.json.staleIfError.windowEndMs === 90_000);
+  check('回退 trail 含 age/lifetime/stale-if-error 步骤',
+    ['age', 'lifetime', 'stale-if-error'].every((s) => r.json.staleIfError.trail.some((t: any) => t.step === s)));
+  check('旧条目原样保留（body/headers/storedAt 未动）',
+    r.json.entry.body === 'sie-body' && r.json.entry.storedAt === T0 &&
+    r.json.entry.responseHeaders['cache-control'] === 'max-age=60, stale-if-error=30');
+  r = await call(app, 'POST', '/cache/revalidate', sie503);
+  check('同一 503 重放 => 幂等（idempotentReplay）', r.status === 200 && r.json.idempotentReplay === true);
+  let tokList = (await call(app, 'GET', '/cache/tokens?all=1')).json.tokens;
+  check('令牌已 consumed，摘要记录回退', tokList.some((t: any) =>
+    t.token === sieToken && t.status === 'consumed' && /served-stale-if-error/.test(t.result_summary ?? '')));
+  let decs = (await call(app, 'GET', '/cache/decisions?limit=50')).json.decisions;
+  check('回退判定落库（state=stale-if-error, action=served-stale-if-error）',
+    decs.some((d: any) => d.state === 'stale-if-error' && d.action === 'served-stale-if-error' && d.token === sieToken));
+  // 等待者下一次请求：旧条目未被 503 覆盖，仍过期 => 重新签发令牌再回源
+  r = await call(app, 'POST', '/cache/request', { url: 'https://sie.test/a', virtualTime: T0 + 80_000 });
+  check('等待者下次请求仍见旧条目（expired 并签发新令牌）',
+    r.json.state === 'expired' && r.json.token?.leader === true && r.json.token.token !== sieToken);
+  r = await call(app, 'POST', '/cache/revalidate', {
+    token: r.json.token.token, status: 500, body: 'err2', originTime: T0 + 80_000,
+  });
+  check('窗口内再次 5xx => 再次 served-stale-if-error', r.json.outcome === 'served-stale-if-error' && r.json.staleIfError.reason === 'within-window');
+
+  // 超窗：t+95s，staleness = 35s > 30s => 保留错误结果
+  r = await call(app, 'POST', '/cache/request', { url: 'https://sie.test/a', virtualTime: T0 + 95_000 });
+  const lateToken = r.json.token.token;
+  r = await call(app, 'POST', '/cache/revalidate', {
+    token: lateToken, status: 503, headers: {}, body: 'err-late', originTime: T0 + 95_000,
+  });
+  check('超窗 503 => 保留错误结果（outcome=updated）', r.status === 200 && r.json.outcome === 'updated' && r.json.staleIfError?.serveStale === false);
+  check('超窗原因 window-exceeded 且年龄留痕（age=95s）', r.json.staleIfError.reason === 'window-exceeded' && r.json.staleIfError.ageMs === 95_000);
+  check('错误结果已写入条目（status=503）', r.json.entry.status === 503 && r.json.entry.body === 'err-late');
+  decs = (await call(app, 'GET', '/cache/decisions?limit=50')).json.decisions;
+  check('超窗判定同样落库（action=stored-error-response）',
+    decs.some((d: any) => d.state === 'stale-if-error' && d.action === 'stored-error-response' && d.token === lateToken));
+
+  // 无 stale-if-error 指令：5xx 直接保留错误结果
+  await call(app, 'POST', '/admin/entries', {
+    url: 'https://sie.test/plain',
+    responseHeaders: { 'cache-control': 'max-age=60' },
+    body: 'plain',
+    storedAt: T0,
+  });
+  r = await call(app, 'POST', '/cache/request', { url: 'https://sie.test/plain', virtualTime: T0 + 70_000 });
+  const plainToken = r.json.token.token;
+  r = await call(app, 'POST', '/cache/revalidate', {
+    token: plainToken, status: 502, headers: {}, body: 'err-plain', originTime: T0 + 70_000,
+  });
+  check('无 stale-if-error 指令 => 保留错误结果', r.json.outcome === 'updated' && r.json.staleIfError.reason === 'no-stale-if-error-directive');
+  check('错误结果覆盖旧条目', r.json.entry.status === 502 && r.json.entry.body === 'err-plain');
+
+  // 无旧条目（miss 令牌）：5xx 只能保留错误结果
+  r = await call(app, 'POST', '/cache/request', { url: 'https://sie.test/gone', virtualTime: T0 + 70_000 });
+  const missToken = r.json.token.token;
+  r = await call(app, 'POST', '/cache/revalidate', {
+    token: missToken, status: 504, headers: { 'cache-control': 'max-age=5' }, body: 'err-miss', originTime: T0 + 70_000,
+  });
+  check('无旧条目 => no-old-entry，保留错误结果', r.json.outcome === 'updated' && r.json.staleIfError.reason === 'no-old-entry' && r.json.staleIfError.ageMs === null);
+  check('miss 键的错误结果已存储', r.json.entry.status === 504);
+  r = await call(app, 'POST', '/cache/request', { url: 'https://sie.test/gone', virtualTime: T0 + 72_000 });
+  check('存储的错误结果在新鲜期内可被服务', r.json.state === 'fresh' && r.json.response.status === 504);
+
+  // analytics：stale-if-error 判定计入 total 与 Age 样本，但不属于七种请求状态
+  r = await call(app, 'POST', '/cache/analytics', { virtualFrom: T0, virtualTo: T0 + 100_000, bucketSeconds: 60 });
+  check('analytics：回退判定计入 total，七状态计数不含 stale-if-error',
+    r.json.summary.total === 12 &&
+    r.json.summary.counts.expired + r.json.summary.counts.miss + r.json.summary.counts.fresh === 7);
+
   console.log(`\n结果：${passed} 通过，${failed} 失败`);
   await app.close();
   if (failed > 0) process.exit(1);
